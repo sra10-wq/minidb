@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "bplus_tree.h"
 #include "buffer_pool.h"
 #include "sql_ast.h"
 #include "table_heap.h"
@@ -11,12 +12,20 @@ struct QueryResult {
     std::vector<std::string> columns;  // empty for statements that don't return rows
     std::vector<Row> rows;
     std::string message;
+    std::string plan;                  // how a query found its rows
+};
+
+struct IndexInfo {
+    std::string name;
+    std::size_t column;  // position in the table schema
+    std::unique_ptr<BPlusTree> tree;
 };
 
 struct TableInfo {
     std::string name;
     Schema schema;
     std::unique_ptr<TableHeap> heap;
+    std::vector<IndexInfo> indexes;
 };
 
 // Owns the file, buffer pool, and catalog. Page 0 of the file stores the catalog.

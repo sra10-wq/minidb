@@ -1,5 +1,7 @@
 #include "database.h"
+#include <climits>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -20,6 +22,12 @@ struct BoundCond {
     bool rhs_is_column;
     std::size_t right;
     Value value;
+};
+
+// Inclusive key range for an index scan.
+struct KeyRange {
+    int64_t lo = INT64_MIN, hi = INT64_MAX;
+    bool equality = false;
 };
 
 Type type_of(const Value& v) { return std::holds_alternative<int64_t>(v) ? Type::INT : Type::TEXT; }
@@ -92,6 +100,54 @@ bool matches(const std::vector<BoundCond>& conds, const Row& row) {
     return true;
 }
 
+// Planner: find an index whose column the WHERE clause constrains, and turn those
+// conditions into one key range. Prefers an equality match.
+std::optional<std::pair<const IndexInfo*, KeyRange>> choose_index(const TableInfo& t,
+                                                                   const std::vector<BoundCond>& conds) {
+    std::optional<std::pair<const IndexInfo*, KeyRange>> best;
+    for (const IndexInfo& ix : t.indexes) {
+        KeyRange r;
+        bool used = false;
+        for (const BoundCond& c : conds) {
+            if (c.rhs_is_column || c.left != ix.column) continue;
+            int64_t v = std::get<int64_t>(c.value);
+            switch (c.op) {
+                case CmpOp::EQ: r.lo = std::max(r.lo, v); r.hi = std::min(r.hi, v); r.equality = true; break;
+                case CmpOp::GE: r.lo = std::max(r.lo, v); break;
+                case CmpOp::LE: r.hi = std::min(r.hi, v); break;
+                case CmpOp::GT: if (v == INT64_MAX) r.lo = 1, r.hi = 0; else r.lo = std::max(r.lo, v + 1); break;
+                case CmpOp::LT: if (v == INT64_MIN) r.lo = 1, r.hi = 0; else r.hi = std::min(r.hi, v - 1); break;
+                case CmpOp::NE: continue;  // can't narrow a range
+            }
+            used = true;
+        }
+        if (!used) continue;
+        if (!best || (r.equality && !best->second.equality)) best = std::make_pair(&ix, r);
+    }
+    return best;
+}
+
+// Visit every row of t matching conds (using an index if possible). Returns the plan used.
+// fn returns false to stop early.
+std::string for_each_match(TableInfo& t, const std::vector<BoundCond>& conds,
+                           const std::function<bool(const RID&, const Row&)>& fn) {
+    if (auto choice = choose_index(t, conds)) {
+        const auto& [ix, range] = *choice;
+        std::vector<RID> rids;
+        ix->tree->scan_range(range.lo, range.hi, [&](int64_t, const RID& rid) {
+            rids.push_back(rid);
+            return true;
+        });
+        for (const RID& rid : rids) {
+            auto row = t.heap->get(rid);
+            if (row && matches(conds, *row) && !fn(rid, *row)) break;  // recheck all conditions
+        }
+        return "index scan using " + ix->name;
+    }
+    t.heap->scan([&](const RID& rid, const Row& r) { return !matches(conds, r) || fn(rid, r); });
+    return "full table scan";
+}
+
 }  // namespace
 
 // ---------------- setup and catalog ----------------
@@ -108,8 +164,9 @@ Database::Database(const std::string& path, std::size_t pool_size)
 
 Database::~Database() { bp_.flush_all(); }
 
-// Catalog format (text in page 0), one table per line:
-//   name first_page num_cols col1 i|t col2 i|t ...
+// Catalog format (text in page 0), one entry per line:
+//   table:  name first_page num_cols col1 i|t col2 i|t ...
+//   index:  @ index_name table_name column_name header_page
 void Database::load_catalog() {
     Page* p = bp_.fetch_page(0);
     std::string text(p->data, strnlen(p->data, PAGE_SIZE));
@@ -119,6 +176,15 @@ void Database::load_catalog() {
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         std::istringstream ls(line);
+        if (line[0] == '@') {
+            std::string at, name, table_name, column;
+            page_id_t header;
+            ls >> at >> name >> table_name >> column >> header;
+            TableInfo& t = table(table_name);
+            std::size_t col = resolve(columns_of(t), {"", column});
+            t.indexes.push_back({name, col, std::make_unique<BPlusTree>(bp_, header)});
+            continue;
+        }
         TableInfo t;
         page_id_t first;
         std::size_t n;
@@ -137,11 +203,15 @@ void Database::load_catalog() {
 
 void Database::save_catalog() {
     std::ostringstream out;
-    for (const auto& [name, t] : tables_) {
+    for (const auto& [name, t] : tables_) {  // tables first...
         out << name << ' ' << t.heap->first_page() << ' ' << t.schema.size();
         for (const Column& c : t.schema) out << ' ' << c.name << ' ' << (c.type == Type::INT ? 'i' : 't');
         out << '\n';
     }
+    for (const auto& [name, t] : tables_)  // ...then indexes, which refer to tables
+        for (const IndexInfo& ix : t.indexes)
+            out << "@ " << ix.name << ' ' << name << ' ' << t.schema[ix.column].name << ' '
+                << ix.tree->header_page() << '\n';
     std::string s = out.str();
     if (s.size() >= PAGE_SIZE) throw std::runtime_error("catalog full");
     Page* p = bp_.fetch_page(0);
@@ -182,18 +252,39 @@ QueryResult Database::run(const CreateTable& s) {
     t.heap = std::make_unique<TableHeap>(bp_, TableHeap::create(bp_), t.schema);
     tables_.emplace(s.table, std::move(t));
     save_catalog();
-    return {{}, {}, "table '" + s.table + "' created"};
+    return {{}, {}, "table '" + s.table + "' created", ""};
 }
 
-QueryResult Database::run(const CreateIndex&) {
-    throw std::runtime_error("CREATE INDEX is not supported yet");
+QueryResult Database::run(const CreateIndex& s) {
+    TableInfo& t = table(s.table);
+    for (const auto& [name, other] : tables_)
+        for (const IndexInfo& ix : other.indexes)
+            if (ix.name == s.name) throw std::runtime_error("index '" + s.name + "' already exists");
+    std::size_t col = resolve(columns_of(t), {"", s.column});
+    if (t.schema[col].type != Type::INT) throw std::runtime_error("only INT columns can be indexed");
+    for (const IndexInfo& ix : t.indexes)
+        if (ix.column == col) throw std::runtime_error("column '" + s.column + "' is already indexed");
+
+    IndexInfo ix{s.name, col, std::make_unique<BPlusTree>(bp_, BPlusTree::create(bp_))};
+    std::size_t n = 0;
+    t.heap->scan([&](const RID& rid, const Row& r) {  // index every existing row
+        ix.tree->insert(std::get<int64_t>(r[col]), rid);
+        n++;
+        return true;
+    });
+    t.indexes.push_back(std::move(ix));
+    save_catalog();
+    return {{}, {}, "index '" + s.name + "' created (" + std::to_string(n) + " rows)", ""};
 }
 
 QueryResult Database::run(const Insert& s) {
     TableInfo& t = table(s.table);
     for (const Row& row : s.rows) serialize_row(t.schema, row);  // validate all rows before inserting any
-    for (const Row& row : s.rows) t.heap->insert(row);
-    return {{}, {}, std::to_string(s.rows.size()) + " row(s) inserted"};
+    for (const Row& row : s.rows) {
+        RID rid = t.heap->insert(row);
+        for (IndexInfo& ix : t.indexes) ix.tree->insert(std::get<int64_t>(row[ix.column]), rid);
+    }
+    return {{}, {}, std::to_string(s.rows.size()) + " row(s) inserted", ""};
 }
 
 QueryResult Database::run(const Select& s) {
@@ -226,7 +317,6 @@ QueryResult Database::run(const Select& s) {
     if (limit == 0) return res;
     // returns false once LIMIT is reached, which stops the scan early
     auto emit = [&](const Row& full) {
-        if (!matches(conds, full)) return true;
         Row out;
         for (std::size_t i : proj) out.push_back(full[i]);
         res.rows.push_back(std::move(out));
@@ -234,23 +324,25 @@ QueryResult Database::run(const Select& s) {
     };
 
     if (!jt) {
-        t.heap->scan([&](const RID&, const Row& r) { return emit(r); });
-    } else {
-        std::size_t li = resolve(cols, s.join->left), ri = resolve(cols, s.join->right);
-        if (cols[li].type != cols[ri].type) throw std::runtime_error("JOIN columns have different types");
-        // nested-loop join: load the inner table once, then pair it with each outer row
-        std::vector<Row> inner;
-        jt->heap->scan([&](const RID&, const Row& r) { inner.push_back(r); return true; });
-        t.heap->scan([&](const RID&, const Row& outer) {
-            for (const Row& r : inner) {
-                Row full = outer;
-                full.insert(full.end(), r.begin(), r.end());
-                if (compare(full[li], full[ri]) != 0) continue;
-                if (!emit(full)) return false;
-            }
-            return true;
-        });
+        res.plan = for_each_match(t, conds, [&](const RID&, const Row& r) { return emit(r); });
+        return res;
     }
+
+    std::size_t li = resolve(cols, s.join->left), ri = resolve(cols, s.join->right);
+    if (cols[li].type != cols[ri].type) throw std::runtime_error("JOIN columns have different types");
+    // nested-loop join: load the inner table once, then pair it with each outer row
+    std::vector<Row> inner;
+    jt->heap->scan([&](const RID&, const Row& r) { inner.push_back(r); return true; });
+    t.heap->scan([&](const RID&, const Row& outer) {
+        for (const Row& r : inner) {
+            Row full = outer;
+            full.insert(full.end(), r.begin(), r.end());
+            if (compare(full[li], full[ri]) != 0 || !matches(conds, full)) continue;
+            if (!emit(full)) return false;
+        }
+        return true;
+    });
+    res.plan = "nested loop join";
     return res;
 }
 
@@ -266,25 +358,37 @@ QueryResult Database::run(const Update& s) {
     }
     // collect first, then modify, so the scan never sees its own changes
     std::vector<std::pair<RID, Row>> todo;
-    t.heap->scan([&](const RID& rid, const Row& r) {
-        if (matches(conds, r)) todo.push_back({rid, r});
+    std::string plan = for_each_match(t, conds, [&](const RID& rid, const Row& r) {
+        todo.push_back({rid, r});
         return true;
     });
-    for (auto& [rid, row] : todo) {
+    for (const auto& [rid, old_row] : todo) {
+        Row row = old_row;
         for (const auto& [i, v] : sets) row[i] = v;
-        t.heap->update(rid, row);
+        RID new_rid = t.heap->update(rid, row);
+        for (IndexInfo& ix : t.indexes) {  // keep indexes in sync (key or location may change)
+            int64_t old_key = std::get<int64_t>(old_row[ix.column]);
+            int64_t new_key = std::get<int64_t>(row[ix.column]);
+            if (old_key != new_key || !(new_rid == rid)) {
+                ix.tree->remove(old_key, rid);
+                ix.tree->insert(new_key, new_rid);
+            }
+        }
     }
-    return {{}, {}, std::to_string(todo.size()) + " row(s) updated"};
+    return {{}, {}, std::to_string(todo.size()) + " row(s) updated", plan};
 }
 
 QueryResult Database::run(const Delete& s) {
     TableInfo& t = table(s.table);
     std::vector<BoundCond> conds = bind_where(s.where, columns_of(t));
-    std::vector<RID> todo;
-    t.heap->scan([&](const RID& rid, const Row& r) {
-        if (matches(conds, r)) todo.push_back(rid);
+    std::vector<std::pair<RID, Row>> todo;
+    std::string plan = for_each_match(t, conds, [&](const RID& rid, const Row& r) {
+        todo.push_back({rid, r});
         return true;
     });
-    for (const RID& rid : todo) t.heap->remove(rid);
-    return {{}, {}, std::to_string(todo.size()) + " row(s) deleted"};
+    for (const auto& [rid, row] : todo) {
+        t.heap->remove(rid);
+        for (IndexInfo& ix : t.indexes) ix.tree->remove(std::get<int64_t>(row[ix.column]), rid);
+    }
+    return {{}, {}, std::to_string(todo.size()) + " row(s) deleted", plan};
 }

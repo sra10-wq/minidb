@@ -23,3 +23,11 @@ foreach(test_src ${TEST_SOURCES})
   add_executable(${test_name} ${test_src})
   target_link_libraries(${test_name} minidb_core)
 endforeach()
+
+# one benchmark executable per file in bench/
+file(GLOB BENCH_SOURCES bench/*.cpp)
+foreach(bench_src ${BENCH_SOURCES})
+  get_filename_component(bench_name ${bench_src} NAME_WE)
+  add_executable(${bench_name} ${bench_src})
+  target_link_libraries(${bench_name} minidb_core)
+endforeach()

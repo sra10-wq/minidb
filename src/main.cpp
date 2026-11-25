@@ -35,6 +35,7 @@ static void print_result(const QueryResult& r, double ms) {
     }
     if (!r.rows.empty()) rule();
     std::cout << r.rows.size() << " row(s) (" << ms << " ms)\n";
+    if (!r.plan.empty()) std::cout << "plan: " << r.plan << "\n";
 }
 
 int main(int argc, char** argv) {
