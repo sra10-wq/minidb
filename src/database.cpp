@@ -330,19 +330,57 @@ QueryResult Database::run(const Select& s) {
 
     std::size_t li = resolve(cols, s.join->left), ri = resolve(cols, s.join->right);
     if (cols[li].type != cols[ri].type) throw std::runtime_error("JOIN columns have different types");
-    // nested-loop join: load the inner table once, then pair it with each outer row
-    std::vector<Row> inner;
-    jt->heap->scan([&](const RID&, const Row& r) { inner.push_back(r); return true; });
-    t.heap->scan([&](const RID&, const Row& outer) {
-        for (const Row& r : inner) {
-            Row full = outer;
-            full.insert(full.end(), r.begin(), r.end());
-            if (compare(full[li], full[ri]) != 0 || !matches(conds, full)) continue;
-            if (!emit(full)) return false;
-        }
-        return true;
-    });
-    res.plan = "nested loop join";
+    const std::size_t nt = t.schema.size();  // positions [0, nt) come from t, the rest from jt
+    if ((li < nt) == (ri < nt))
+        throw std::runtime_error("JOIN condition must compare one column from each table");
+    const std::size_t outer_col = li < nt ? li : ri;         // join column in t
+    const std::size_t inner_col = (li < nt ? ri : li) - nt;  // join column in jt
+
+    auto find_index = [](const TableInfo& tbl, std::size_t col) -> const IndexInfo* {
+        for (const IndexInfo& ix : tbl.indexes)
+            if (ix.column == col) return &ix;
+        return nullptr;
+    };
+    // combine one row from each side; emit it if it passes WHERE. false = LIMIT reached
+    auto output = [&](const Row& outer, const Row& inner) {
+        Row full = outer;
+        full.insert(full.end(), inner.begin(), inner.end());
+        return !matches(conds, full) || emit(full);
+    };
+
+    if (const IndexInfo* inner_ix = find_index(*jt, inner_col)) {
+        // index nested loop join: for each t row, probe jt's index for matching rows
+        t.heap->scan([&](const RID&, const Row& outer) {
+            for (const RID& rid : inner_ix->tree->lookup(std::get<int64_t>(outer[outer_col]))) {
+                auto inner = jt->heap->get(rid);
+                if (inner && !output(outer, *inner)) return false;
+            }
+            return true;
+        });
+        res.plan = "index nested loop join using " + inner_ix->name;
+    } else if (const IndexInfo* outer_ix = find_index(t, outer_col)) {
+        // same idea with roles flipped: for each jt row, probe t's index
+        jt->heap->scan([&](const RID&, const Row& inner) {
+            for (const RID& rid : outer_ix->tree->lookup(std::get<int64_t>(inner[inner_col]))) {
+                auto outer = t.heap->get(rid);
+                if (outer && !output(*outer, inner)) return false;
+            }
+            return true;
+        });
+        res.plan = "index nested loop join using " + outer_ix->name;
+    } else {
+        // nested loop join: load jt once, compare join keys for every pair
+        std::vector<Row> inner_rows;
+        jt->heap->scan([&](const RID&, const Row& r) { inner_rows.push_back(r); return true; });
+        t.heap->scan([&](const RID&, const Row& outer) {
+            for (const Row& inner : inner_rows) {
+                if (compare(outer[outer_col], inner[inner_col]) != 0) continue;  // check key before copying
+                if (!output(outer, inner)) return false;
+            }
+            return true;
+        });
+        res.plan = "nested loop join";
+    }
     return res;
 }
 
